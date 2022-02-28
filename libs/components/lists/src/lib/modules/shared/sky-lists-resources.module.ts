@@ -24,7 +24,7 @@ const RESOURCES: { [locale: string]: SkyLibResources } = {
     skyux_paging_label: { message: 'Pagination' },
     skyux_paging_next: { message: 'Next' },
     skyux_paging_previous: { message: 'Previous' },
-    skyux_repeater_label: { message: 'List of items' },
+    skyux_repeater_label_default: { message: 'List of items' },
     skyux_repeater_item_expand: { message: 'Expand or collapse {0}' },
     skyux_repeater_item_expand_default: { message: 'Expand or collapse' },
     skyux_repeater_item_checkbox_label: { message: 'Select {0}' },

@@ -13,6 +13,7 @@ import {
   QueryList,
   Renderer2,
   SimpleChanges,
+  ViewChild,
 } from '@angular/core';
 
 import { DragulaService } from 'ng2-dragula';
@@ -26,6 +27,10 @@ import { SkyRepeaterItemComponent } from './repeater-item.component';
 import { SkyRepeaterService } from './repeater.service';
 
 import { SkyRepeaterAdapterService } from './repeater-adapter.service';
+
+import { FocusKeyManager, FocusMonitor } from '@angular/cdk/a11y';
+
+import { SelectionModel } from '@angular/cdk/collections';
 
 let uniqueId = 0;
 
@@ -49,13 +54,22 @@ export class SkyRepeaterComponent
    * to highlight a repeater item while users edit it. Only one item can be active at a time.
    */
   @Input()
-  public activeIndex: number;
+  public set activeIndex(value: number) {
+    /* istanbul ignore else */
+    if (value !== this._activeIndex) {
+      this._activeIndex = value;
+    }
+  }
+
+  public get activeIndex(): number {
+    return this._activeIndex;
+  }
 
   /**
    * Specifies an ARIA label for the repeater list.
    * This sets the repeater list's `aria-label` attribute
    * [to support accessibility](https://developer.blackbaud.com/skyux/learn/accessibility).
-   * @default "List of items"
+   * @default 'List of items'
    */
   @Input()
   public ariaLabel: string;
@@ -85,7 +99,7 @@ export class SkyRepeaterComponent
    * allows users to expand one item at a time. It provides the most compact view and is
    * best-suited to repeater items where the most important information is in the titles
    * and users only occasionally need to view the body content.
-   * @default "none"
+   * @default none
    */
   @Input()
   public set expandMode(value: string) {
@@ -112,13 +126,43 @@ export class SkyRepeaterComponent
   public orderChange = new EventEmitter<any[]>();
 
   @ContentChildren(SkyRepeaterItemComponent)
-  public items: QueryList<SkyRepeaterItemComponent>;
+  public items!: QueryList<SkyRepeaterItemComponent>;
+
+  @ViewChild('listboxRef', { read: ElementRef })
+  public listboxRef: ElementRef;
 
   public dragulaGroupName: string;
 
+  public tabIndex = -1;
+
   private dragulaUnsubscribe = new Subject<void>();
 
+  /**
+   * @internal
+   */
+  public keyManager: FocusKeyManager<SkyRepeaterItemComponent>;
+
+  /**
+   * @internal
+   */
+  public get multipleSelect(): boolean {
+    return this.selectionModel.isMultipleSelection();
+  }
+  public set multipleSelect(value: boolean) {
+    /* istanbul ignore else */
+    if (value !== this.selectionModel.isMultipleSelection()) {
+      this.initSelectionModel(value);
+    }
+  }
+
+  /**
+   * @internal
+   */
+  public selectionModel: SelectionModel<SkyRepeaterItemComponent>;
+
   private ngUnsubscribe = new Subject<void>();
+
+  private _activeIndex: number;
 
   private _expandMode = 'none';
 
@@ -128,7 +172,8 @@ export class SkyRepeaterComponent
     private adapterService: SkyRepeaterAdapterService,
     private dragulaService: DragulaService,
     private elementRef: ElementRef,
-    private renderer: Renderer2
+    private renderer: Renderer2,
+    private focusMonitor: FocusMonitor
   ) {
     this.dragulaGroupName = `sky-repeater-dragula-${++uniqueId}`;
 
@@ -148,15 +193,6 @@ export class SkyRepeaterComponent
         }
       });
 
-    this.repeaterService.activeItemIndexChange
-      .pipe(takeUntil(this.ngUnsubscribe))
-      .subscribe((index: number) => {
-        if (index !== this.activeIndex) {
-          this.activeIndex = index;
-          this.activeIndexChange.emit(index);
-        }
-      });
-
     this.repeaterService.orderChange
       .pipe(takeUntil(this.ngUnsubscribe))
       .subscribe(() => {
@@ -173,10 +209,41 @@ export class SkyRepeaterComponent
   }
 
   public ngAfterContentInit(): void {
-    // If activeIndex has been set on init, call service to activate the appropriate item.
+    this.keyManager = new FocusKeyManager<SkyRepeaterItemComponent>(
+      this.items
+    ).withWrap();
+
+    // If the user attempts to tab out of the selection list, allow focus to escape.
+    this.keyManager.tabOut.pipe(takeUntil(this.ngUnsubscribe)).subscribe(() => {
+      this.allowFocusEscape();
+    });
+
     setTimeout(() => {
-      if (this.activeIndex || this.activeIndex === 0) {
-        this.repeaterService.activateItemByIndex(this.activeIndex);
+      // Set up Angular CDK's focus monitor to implement tabbing/arrow keys for listbox pattern.
+      this.focusMonitor
+        .monitor(this.listboxRef)
+        .pipe(takeUntil(this.ngUnsubscribe))
+        .subscribe((origin) => {
+          if (origin === 'keyboard' || origin === 'program') {
+            let toFocus = 0;
+            for (let i = 0; i < this.items.length; i++) {
+              if (this.selectionModel?.isSelected(this.items.get(i))) {
+                toFocus = i;
+                break;
+              }
+            }
+            this.keyManager.setActiveItem(toFocus);
+          }
+        });
+
+      this.checkSelectionMode();
+
+      // If activeIndex is defined programatically on init, check items after load to make sure
+      // The correct item is marked "selected".
+      if (this.activeIndex !== undefined) {
+        const activeItem = this.items.get(this.activeIndex);
+        this.selectionModel.select(activeItem);
+        this.changeDetector.markForCheck();
       }
 
       if (this.reorderable && !this.everyItemHasTag()) {
@@ -190,13 +257,12 @@ export class SkyRepeaterComponent
     // https://github.com/angular/angular/issues/6005
     this.items.changes.pipe(takeUntil(this.ngUnsubscribe)).subscribe(() => {
       setTimeout(() => {
+        // When the number of options change, update the tabindex of the selection list.
+        this.updateTabIndex();
+
         if (!!this.items.last) {
           this.updateForExpandMode(this.items.last);
           this.items.last.reorderable = this.reorderable;
-        }
-
-        if (this.activeIndex !== undefined) {
-          this.repeaterService.activateItemByIndex(this.activeIndex);
         }
       });
     });
@@ -212,12 +278,22 @@ export class SkyRepeaterComponent
 
   public ngOnChanges(changes: SimpleChanges): void {
     if (changes['activeIndex']) {
-      this.repeaterService.enableActiveState = true;
+      this.initSelectionModel(false);
+      this.checkSelectionMode();
       if (
         changes['activeIndex'].currentValue !==
         changes['activeIndex'].previousValue
       ) {
-        this.repeaterService.activateItemByIndex(this.activeIndex);
+        const lastActiveItem = this.items?.get(
+          changes['activeIndex'].previousValue
+        );
+        const activeItem = this.items?.get(this.activeIndex);
+        if (this.activeIndex) {
+          this.selectionModel.select(activeItem);
+        } else {
+          this.selectionModel.deselect(lastActiveItem);
+        }
+        this.activeIndexChange.next(this.activeIndex);
       }
     }
 
@@ -231,9 +307,72 @@ export class SkyRepeaterComponent
   }
 
   public ngOnDestroy(): void {
+    this.focusMonitor.stopMonitoring(this.listboxRef);
     this.ngUnsubscribe.next();
     this.ngUnsubscribe.complete();
     this.destroyDragAndDrop();
+  }
+
+  public onKeydown(event: KeyboardEvent) {
+    /*istanbul ignore else */
+    if (event.key) {
+      switch (event.key.toUpperCase()) {
+        case ' ':
+        case 'ENTER':
+          const focusedItem = this.getFocusedItem();
+          if (event.target === focusedItem.itemRef.nativeElement) {
+            this.toggleFocusedOption();
+            event.preventDefault();
+          }
+          break;
+
+        default:
+          this.keyManager.onKeydown(event);
+          break;
+      }
+    }
+  }
+
+  public checkSelectionMode(): void {
+    /* istanbul ignore else */
+    if (this.items) {
+      const selectableItems = this.items.some(
+        (item) => item.selectable === true
+      );
+
+      /* istanbul ignore else */
+      if (!this.selectionModel?.isMultipleSelection() && selectableItems) {
+        console.warn(
+          '`activeIndex` cannot be used in conjuction with selectable repeater items. For multi-select repeaters, use the `selectable` input. For single-select or "active" repeaters, use the `activeIndex` input.'
+        );
+      }
+    }
+  }
+
+  /** Toggles the state of the currently focused option if enabled. */
+  private toggleFocusedOption(): void {
+    const focusedItem = this.getFocusedItem();
+    if (!focusedItem) {
+      return;
+    }
+
+    /* istanbul ignore else */
+    if (this.isItemSelectable(focusedItem)) {
+      focusedItem.toggleSelection();
+
+      // TODO: DO WE NEED THIS?
+      // Emit a change event because the focused option changed its state through user
+      // interaction.
+    }
+  }
+
+  /**
+   * Utility to ensure all indexes are valid.
+   * @param index The index to be checked.
+   * @returns True if the index is valid for our list of items.
+   */
+  private isValidIndex(index: number): boolean {
+    return index >= 0 && index < this.items.length;
   }
 
   private updateForExpandMode(itemAdded?: SkyRepeaterItemComponent): void {
@@ -309,6 +448,16 @@ export class SkyRepeaterComponent
       });
   }
 
+  public initSelectionModel(multiple: boolean) {
+    /* istanbul ignore else */
+    if (
+      !this.selectionModel ||
+      this.selectionModel.isMultipleSelection() !== multiple
+    ) {
+      this.selectionModel = new SelectionModel(multiple);
+    }
+  }
+
   private destroyDragAndDrop(): void {
     this.dragulaUnsubscribe.next();
     this.dragulaUnsubscribe.complete();
@@ -335,5 +484,46 @@ export class SkyRepeaterComponent
     return this.items.toArray().every((item) => {
       return item.tag !== undefined;
     });
+  }
+
+  /**
+   * Returns true if either one of the conditions is met:
+   * 1. `activeIndex` is bound (single select mode)
+   * 2. item is selectable
+   */
+  private isItemSelectable(item: SkyRepeaterItemComponent): boolean {
+    /* istanbul ignore if */
+    if (!item) {
+      return false;
+    }
+
+    return !this.multipleSelect || item?.selectable;
+  }
+
+  private getFocusedItem(): SkyRepeaterItemComponent | undefined {
+    let focusedIndex = this.keyManager.activeItemIndex;
+
+    /* istanbul ignore else */
+    if (focusedIndex != null && this.isValidIndex(focusedIndex)) {
+      return this.items.get(focusedIndex);
+    }
+  }
+  /**
+   * Removes the tabindex from the selection list and resets it back afterwards, allowing the user
+   * to tab out of it. This prevents the list from capturing focus and redirecting it back within
+   * the list, creating a focus trap if it user tries to tab away.
+   */
+  private allowFocusEscape() {
+    this.tabIndex = -1;
+
+    setTimeout(() => {
+      this.tabIndex = 0;
+      this.changeDetector.markForCheck();
+    });
+  }
+
+  /** Updates the tabindex based upon if the selection list is empty. */
+  private updateTabIndex(): void {
+    this.tabIndex = this.items.length === 0 ? -1 : 0;
   }
 }
